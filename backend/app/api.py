@@ -16,7 +16,33 @@ from sqlalchemy import or_, func
 import sys
 import os
 import base64
+import hashlib
+import secrets
+import hmac
 from uuid import uuid4
+
+
+# ===== 密碼雜湊 (stdlib scrypt, 無額外套件) =====
+def hash_password(pw: str) -> str:
+    """回傳 'scrypt$salt$hash' 格式的雜湊密碼。"""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    """驗證密碼。支援既有的明文密碼 (向後相容)。"""
+    if not stored:
+        return False
+    if stored.startswith("scrypt$"):
+        try:
+            _, salt_hex, hash_hex = stored.split("$", 2)
+            dk = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32)
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except Exception:
+            return False
+    # 既有明文密碼 (登入成功後會自動升級為雜湊)
+    return hmac.compare_digest(pw.strip(), stored.strip())
 
 # 添加父目錄到 Python 路徑
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,7 +71,7 @@ app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 允許所有來源
-    allow_credentials=True,
+    allow_credentials=False,  # 無 cookie 驗證；與 "*" 搭配才有效且安全
     allow_methods=["*"],  # 允許所有方法
     allow_headers=["*"],  # 允許所有標頭
 )
@@ -237,6 +263,8 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
         user_data = user.model_dump()
     else:
         user_data = user.dict()
+    if user_data.get("password"):
+        user_data["password"] = hash_password(str(user_data["password"]))
     db_user = User(**user_data)
     db.add(db_user)
     db.commit()
@@ -463,18 +491,19 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     sys.stdout.write(f"[登入] ✅ 找到用戶: {user.name} (ID: {user.id})\n")
     sys.stdout.flush()
     
-    # 處理 None 情況並去除空白字符
-    db_password = str(user.password).strip() if user.password is not None else ""
+    db_password = str(user.password) if user.password is not None else ""
     input_password = str(data.password).strip() if data.password is not None else ""
-    
-    sys.stdout.write(f"[登入] 資料庫密碼: '{db_password}' vs 輸入密碼: '{input_password}'\n")
-    sys.stdout.flush()
-    
-    if db_password != input_password:
+
+    if not verify_password(input_password, db_password):
         sys.stdout.write(f"[登入] ❌ 密碼不匹配\n")
         sys.stdout.flush()
         raise HTTPException(status_code=401, detail="帳號或密碼錯誤")
-    
+
+    # 既有明文密碼於登入成功後自動升級為雜湊
+    if not db_password.startswith("scrypt$"):
+        user.password = hash_password(input_password)
+        db.commit()
+
     sys.stdout.write(f"[登入] ✅ 登入成功: {user.name}\n")
     sys.stdout.flush()
     
@@ -553,7 +582,11 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
                     raise HTTPException(status_code=500, detail="圖片處理失敗，請稍後再試")
             elif not raw_photo_value:
                 user_data['photo'] = None
-        
+
+        # 雜湊密碼後再儲存
+        if user_data.get("password"):
+            user_data["password"] = hash_password(str(user_data["password"]))
+
         db_user = User(**user_data)
         db.add(db_user)
         db.commit()
